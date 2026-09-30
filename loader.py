@@ -9,7 +9,7 @@ import os
 import threading
 import comfy.memory_management
 from .ops import GGMLTensor
-from .dequant import is_quantized, dequantize_tensor
+from .dequant import is_quantized, dequantize_tensor, dequantize_functions
 from .quant_ops import make_quantized
 
 IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "ltxv_upscaler", "hyvid", "wan", "lumina2", "qwen_image", "qwen_image21", "ideogram", "krea2", "minimax_h3", "minimax_h3_vae", "minimax_music3"}
@@ -132,6 +132,28 @@ def normalize_raw_byte_tensor(value):
     return value.to(torch.uint8).contiguous()
 
 
+def dequantize_1d_tensor(tensor, tensor_name):
+    """Dequantize a small 1D tensor to a plain fp32 tensor for direct use.
+
+    GGML block storage does not match the logical shape of quantized 1D
+    tensors (norm weights quantized by some sd.cpp builds), so they cannot
+    stay quantized: any use outside GGML Linear ops would read raw bytes.
+    The result must be a plain tensor, not a GGMLTensor subclass, because
+    the subclass clone()/detach()/copy_() semantics are only valid while a
+    tensor is still quantized.
+    """
+    qtype = getattr(tensor, "tensor_type", None)
+    try:
+        return dequantize_tensor(
+            tensor, dtype=torch.float32, dequant_dtype="target"
+        ).as_subclass(torch.Tensor)
+    except Exception as e:
+        raise ValueError(
+            f"Failed to dequantize 1D tensor {tensor_name!r} "
+            f"(qtype: {getattr(qtype, 'name', qtype)}): {e}"
+        ) from e
+
+
 def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=False, dynamic=False, progress_callback=None):
     """
     Read state dict as fake tensors
@@ -233,6 +255,15 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
 
         # add to state dict
         raw_byte_tensor = sd_key in RAW_BYTE_TENSOR_KEYS and len(shape) == 1
+        # 1D tensors shouldn't be quantized, this is a fix for BF16 and for
+        # sd.cpp builds that quantize 1D norm weights. Restrict it to types
+        # with a working dequantizer and to tensors without custom Q8_CR/Q4_CR
+        # markers so unsupported payloads keep loading as before.
+        dequantize_1d = (
+            len(shape) <= 1
+            and sd_key not in custom_quant_tensor_names
+            and tensor.tensor_type in dequantize_functions
+        )
         if raw_byte_tensor and tensor.tensor_type == gguf.GGMLQuantizationType.I8:
             # GGUF has no U8 type. I8 is used only as a byte-preserving
             # container for tokenizer payloads.
@@ -243,12 +274,10 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
                 gguf.GGMLQuantizationType.F16,
             }:
                 state_dict[sd_key] = torch_tensor.view(*shape)
-            elif len(shape) <= 1:
-                # 1D tensors shouldn't be quantized, this is a fix for BF16 and for
-                # sd.cpp builds that quantize 1D norm weights
-                state_dict[sd_key] = dequantize_tensor(
+            elif dequantize_1d:
+                state_dict[sd_key] = dequantize_1d_tensor(
                     GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape),
-                    dtype=torch.float32,
+                    tensor_name,
                 )
             elif tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
                 state_dict[sd_key] = torch_tensor.view(torch.bfloat16).reshape(shape).to(
@@ -268,9 +297,10 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=dtype)
 
         # 1D tensors shouldn't be quantized, this is a fix for BF16 and for
-        # sd.cpp builds that quantize 1D norm weights
-        if not dynamic and len(shape) <= 1 and is_quantized(state_dict[sd_key]):
-            state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.float32)
+        # sd.cpp builds that quantize 1D norm weights. BF16 1D is already
+        # handled above, hence the is_quantized re-check.
+        if not dynamic and dequantize_1d and is_quantized(state_dict[sd_key]):
+            state_dict[sd_key] = dequantize_1d_tensor(state_dict[sd_key], tensor_name)
 
         # keep track of loaded tensor types
         tensor_type_str = getattr(tensor.tensor_type, "name", repr(tensor.tensor_type))
