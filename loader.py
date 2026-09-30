@@ -243,9 +243,16 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
                 gguf.GGMLQuantizationType.F16,
             }:
                 state_dict[sd_key] = torch_tensor.view(*shape)
+            elif len(shape) <= 1:
+                # 1D tensors shouldn't be quantized, this is a fix for BF16 and for
+                # sd.cpp builds that quantize 1D norm weights
+                state_dict[sd_key] = dequantize_tensor(
+                    GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape),
+                    dtype=torch.float32,
+                )
             elif tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
                 state_dict[sd_key] = torch_tensor.view(torch.bfloat16).reshape(shape).to(
-                    dtype=torch.float32 if len(shape) <= 1 else bf16_storage_dtype,
+                    dtype=bf16_storage_dtype,
                 )
             else:
                 state_dict[sd_key] = make_quantized(torch_tensor, tensor.tensor_type, shape)
@@ -259,6 +266,11 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         if not dynamic and tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
             dtype = torch.float32 if len(shape) <= 1 else bf16_storage_dtype
             state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=dtype)
+
+        # 1D tensors shouldn't be quantized, this is a fix for BF16 and for
+        # sd.cpp builds that quantize 1D norm weights
+        if not dynamic and len(shape) <= 1 and is_quantized(state_dict[sd_key]):
+            state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.float32)
 
         # keep track of loaded tensor types
         tensor_type_str = getattr(tensor.tensor_type, "name", repr(tensor.tensor_type))

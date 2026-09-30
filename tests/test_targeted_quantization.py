@@ -3135,5 +3135,90 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
             self.assertIsNone(ops_module._configure_perf_logger())
 
 
+class Quantized1DTensorLoaderTests(unittest.TestCase):
+    """sd.cpp builds may quantize 1D norm weights; the loader must dequantize them."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.loader = load_gguf_loader()
+
+    def _write_quantized_norm_gguf(self, path):
+        torch.manual_seed(0)
+        norm = 1.0 + torch.rand(256, dtype=torch.float32)
+        linear = torch.randn((64, 256), dtype=torch.float32)
+        qtype = gguf.GGMLQuantizationType.Q8_0
+        writer = gguf.GGUFWriter(str(path), arch="flux")
+        writer.add_tensor(
+            "norm_in.weight",
+            gguf.quants.quantize(norm.numpy(), qtype),
+            raw_dtype=qtype,
+        )
+        writer.add_tensor(
+            "linear.weight",
+            gguf.quants.quantize(linear.numpy(), qtype),
+            raw_dtype=qtype,
+        )
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+        return norm, linear
+
+    def test_static_loader_dequantizes_quantized_1d_norm_weights(self):
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "sd-cpp-style.gguf"
+            norm, _ = self._write_quantized_norm_gguf(path)
+
+            state_dict, extra = self.loader.gguf_sd_loader(str(path), handle_prefix=None)
+
+            self.assertEqual(extra["arch_str"], "flux")
+            loaded_norm = state_dict["norm_in.weight"]
+            self.assertFalse(self.loader.is_quantized(loaded_norm))
+            self.assertEqual(loaded_norm.dtype, torch.float32)
+            # Q8_0 rounds each value against the block scale; only small error remains.
+            self.assertLess((loaded_norm.float() - norm).abs().max().item(), 0.05)
+            # Multi-dimensional weights must stay quantized.
+            self.assertTrue(self.loader.is_quantized(state_dict["linear.weight"]))
+
+    def test_dynamic_loader_dequantizes_quantized_1d_norm_weights(self):
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "sd-cpp-style.gguf"
+            norm, _ = self._write_quantized_norm_gguf(path)
+
+            state_dict, _ = self.loader.gguf_sd_loader(str(path), handle_prefix=None, dynamic=True)
+
+            loaded_norm = state_dict["norm_in.weight"]
+            self.assertFalse(self.loader.is_quantized(loaded_norm))
+            self.assertEqual(loaded_norm.dtype, torch.float32)
+            self.assertLess((loaded_norm.float() - norm).abs().max().item(), 0.05)
+
+    def test_bf16_1d_norm_weights_load_as_full_precision(self):
+        torch.manual_seed(0)
+        norm = 1.0 + torch.rand(256, dtype=torch.float32)
+        bf16_bytes = norm.to(torch.bfloat16).view(torch.uint8).numpy()
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "bf16-norm.gguf"
+            writer = gguf.GGUFWriter(str(path), arch="flux")
+            writer.add_tensor(
+                "norm_in.weight",
+                bf16_bytes,
+                raw_dtype=gguf.GGMLQuantizationType.BF16,
+            )
+            writer.write_header_to_file()
+            writer.write_kv_data_to_file()
+            writer.write_tensors_to_file()
+            writer.close()
+
+            for dynamic in (False, True):
+                with self.subTest(dynamic=dynamic):
+                    state_dict, _ = self.loader.gguf_sd_loader(
+                        str(path), handle_prefix=None, dynamic=dynamic
+                    )
+                    loaded_norm = state_dict["norm_in.weight"]
+                    self.assertFalse(self.loader.is_quantized(loaded_norm))
+                    self.assertEqual(loaded_norm.dtype, torch.float32)
+                    self.assertLess((loaded_norm.float() - norm).abs().max().item(), 0.01)
+
+
 if __name__ == "__main__":
     unittest.main()
